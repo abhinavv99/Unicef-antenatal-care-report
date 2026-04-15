@@ -1,0 +1,495 @@
+---
+title: "Unequal Progress: Antenatal Care Coverage Across the World"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    theme: flatly
+    highlight-style: github
+execute:
+  warning: false
+  message: false
+  echo: true
+  fig-width: 9
+  fig-height: 5.5
+---
+
+## Introduction
+
+One of the most significant indicators of maternal health is antenatal care, as it reflects whether pregnant women can obtain basic medical care prior to delivery. Despite the common recommendation that at least four antenatal visits is the minimum standard for a healthy pregnancy, this standard has not been attained by all women around the world.
+
+In this report, data provided by UNICEF surveys is used to investigate the variation in antenatal care coverage across countries and how this has evolved over time. The findings indicate that there has been real improvement in many locations, yet inequality still remains. Some countries have developed rapidly over the past decade, while others have shown very little change. The gap between the highest- and lowest-performing countries is still significant.
+
+The primary source of data in this report is *unicef_indicator_2.csv*, which contains the percentage of women aged 15–49 who received at least four antenatal care visits during pregnancy across more than 130 countries. I also use *unicef_metadata.csv*, where a clean join is possible, to include GDP per capita as additional context for the scatterplot analysis.
+
+---
+
+## Data Preparation
+
+The initial process is loading and cleaning data. Column names of the UNICEF file are lengthy and uneven thus I standardise them at the beginning of the analysis. I also change columns containing year and values to appropriate numeric types and delete rows that contain empty critical fields.
+
+```{python}
+import pandas as pd
+import numpy as np
+from plotnine import *
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── Load the main dataset ──────────────────────────────────────────────────────
+df_raw = pd.read_csv("unicef_indicator_2.csv")
+meta_raw = pd.read_csv("unicef_metadata.csv")
+
+# ── Clean column names: strip whitespace, lowercase, replace spaces ────────────
+df_raw.columns = (
+    df_raw.columns
+    .str.strip()
+    .str.lower()
+    .str.replace(" ", "_", regex=False)
+)
+
+meta_raw.columns = (
+    meta_raw.columns
+    .str.strip()
+    .str.lower()
+    .str.replace(" ", "_", regex=False)
+    .str.replace(",", "", regex=False)
+    .str.replace("(", "", regex=False)
+    .str.replace(")", "", regex=False)
+    .str.replace("%", "pct", regex=False)
+    .str.replace("$", "usd", regex=False)
+)
+
+# ── Rename key columns in indicator dataset ────────────────────────────────────
+rename_map = {}
+for c in df_raw.columns:
+    if c in ["country", "geographic_area", "geo_area", "area"]:
+        rename_map[c] = "country"
+    elif "time_period" in c and "activity" not in c:
+        rename_map[c] = "year"
+    elif "obs_value" in c or "observation_value" in c:
+        rename_map[c] = "value"
+
+df = df_raw.rename(columns=rename_map).copy()
+
+# ── Rename important metadata columns (IMPORTANT FIX) ──────────────────────────
+meta_raw = meta_raw.rename(columns={
+    "gdp_per_capita_constant_2015_usd": "gdp_pc",
+    "life_expectancy_at_birth_total_years": "life_expectancy",
+    "birth_rate_crude_per_1000_people": "birth_rate",
+    "population_total": "population"
+})
+
+# ── Convert to numeric types ───────────────────────────────────────────────────
+df["year"] = pd.to_numeric(df["year"], errors="coerce")
+df["value"] = (
+    df["value"]
+    .astype(str)
+    .str.replace("<", "", regex=False)
+    .str.replace(",", "", regex=False)
+    .pipe(pd.to_numeric, errors="coerce")
+)
+
+# ── Drop rows with missing country, year, or value ────────────────────────────
+df = df.dropna(subset=["country", "year", "value"]).copy()
+df = df.sort_values(["country", "year"]).reset_index(drop=True)
+
+print(f"Rows after cleaning: {len(df)}")
+print(f"Countries covered:   {df['country'].nunique()}")
+print(f"Year range:          {int(df['year'].min())} – {int(df['year'].max())}")
+df[["country", "year", "value"]].head(8)
+```
+
+Our data set has been cleaned and now consists of one row per country-year of observation. The spread of coverage values is between under 5% up to 100% and we have plenty to cover.
+
+### Helper dataframes
+
+I construct some smaller summary tables on which the visualisations will be based:
+
+```{python}
+# ── Latest available value per country ────────────────────────────────────────
+latest_per_country = (
+    df.sort_values("year")
+    .groupby("country", as_index=False)
+    .last()[["country", "year", "value"]]
+    .rename(columns={"year": "latest_year", "value": "latest_value"})
+)
+
+# ── Earliest available value per country ──────────────────────────────────────
+first_per_country = (
+    df.sort_values("year")
+    .groupby("country", as_index=False)
+    .first()[["country", "year", "value"]]
+    .rename(columns={"year": "first_year", "value": "first_value"})
+)
+
+# ── Top 10 and bottom 10 by latest coverage ───────────────────────────────────
+top10 = latest_per_country.sort_values("latest_value", ascending=False).head(10).copy()
+bot10 = latest_per_country.sort_values("latest_value", ascending=True).head(10).copy()
+
+# ── Global trend: average coverage per year ───────────────────────────────────
+trend = df.groupby("year", as_index=False)["value"].mean()
+trend = trend[trend["year"] >= 1995]
+
+# ── Country-level improvement: first vs latest ────────────────────────────────
+compare = first_per_country.merge(latest_per_country, on="country", how="inner")
+compare["improvement"] = compare["latest_value"] - compare["first_value"]
+compare["years_observed"] = compare["latest_year"] - compare["first_year"]
+compare = compare[compare["years_observed"] >= 5]
+
+# ── GDP per capita join─────────────────────────────────────
+
+# find GDP column 
+gdp_col = [c for c in meta_raw.columns if "gdp_per_capita" in c][0]
+
+meta_gdp = (
+    meta_raw[["country", "year", gdp_col]]
+    .rename(columns={gdp_col: "gdp_pc"})
+    .dropna(subset=["gdp_pc"])
+    .sort_values("year")
+    .groupby("country", as_index=False)
+    .last()
+)
+
+scatter_df = latest_per_country.merge(
+    meta_gdp[["country", "gdp_pc"]],
+    on="country",
+    how="inner"
+)
+
+scatter_df = scatter_df[
+    (scatter_df["gdp_pc"] > 0) & (~scatter_df["latest_value"].isna())
+]
+
+scatter_df["log_gdp"] = np.log10(scatter_df["gdp_pc"])
+
+print(f"Countries in scatter after GDP join: {len(scatter_df)}")
+```
+
+---
+
+## Visualisations
+
+### 1. Global trend in antenatal care coverage over time
+
+The chart below follows the worldwide average of the coverage of antenatal care in all the surveyed nations starting in 1995. Despite the unequal time of the survey in the different countries, an evident up trend is visible.
+
+```{python}
+(
+    ggplot(trend, aes(x="year", y="value"))
+    + geom_area(fill="#aec6e8", alpha=0.4)
+    + geom_line(size=1.1, color="#1565C0")
+    + geom_point(size=2, color="#1565C0")
+    + scale_x_continuous(breaks=range(1995, 2026, 5))
+    + scale_y_continuous(limits=(0, 100), breaks=range(0, 110, 10))
+    + labs(
+        title="Global Average Antenatal Care Coverage (4+ Visits), 1995–2023",
+        subtitle="Average across all countries with survey data in each year",
+        x="Year",
+        y="Average Coverage (%)"
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(size=13, face="bold"),
+        plot_subtitle=element_text(size=10, color="#555555"),
+        panel_grid_minor=element_blank()
+    )
+)
+```
+
+The percentage of coverage has increased significantly, about 40 percent in the late 1990s to almost 65 percent by the early 2020s, which is quite an improvement. But the mean conceals huge country-level dispersion, as the following charts indicate.
+
+---
+
+### 2. Top 10 countries by latest antenatal care coverage
+
+Which countries are at the top? This graph displays the top ten countries with the highest coverage in the latest survey year they have conducted.
+
+```{python}
+top10_plot = top10.copy()
+top10_plot["label"] = top10_plot["country"].str.replace(
+    "Antigua and Barbuda", "Antigua &\nBarbuda", regex=False
+)
+
+(
+    ggplot(top10_plot, aes(x="reorder(label, latest_value)", y="latest_value"))
+    + geom_col(fill="#1565C0", width=0.65)
+    + geom_text(
+        aes(label=round(top10_plot["latest_value"], 0)),
+        format_string="{:.0f}%",
+        ha="left",
+        nudge_y=0.8,
+        size=9,
+        color="#333333"
+    )
+    + coord_flip()
+    + scale_y_continuous(limits=(0, 108), breaks=range(0, 105, 20))
+    + labs(
+        title="Top 10 Countries — Antenatal Care Coverage (Latest Available Year)",
+        subtitle="Percentage of women (aged 15–49) with 4+ antenatal visits",
+        x=None,
+        y="Coverage (%)"
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(size=12, face="bold"),
+        plot_subtitle=element_text(size=9.5, color="#555555"),
+        panel_grid_minor=element_blank(),
+        panel_grid_major_y=element_blank()
+    )
+)
+```
+
+A number of countries, such as Belarus, Bahrain, and Antigua and Barbada, have coverage that is almost universal at 99 or more. These are predominantly countries that have robust, well-funded healthcare, or have low populations where health care delivery is less challenging to coordinate.
+
+---
+
+### 3. Bottom 10 countries by latest antenatal care coverage
+
+The lowest-performing countries have a shockingly poor coverage at the other end of the scale. These are the nations that have the least likelihood of getting the recommended care by pregnant women.
+
+```{python}
+bot10_plot = bot10.copy()
+bot10_plot["value_label"] = bot10_plot["latest_value"].round(1).astype(str) + "%"
+
+(
+    ggplot(bot10_plot, aes(x="reorder(country, -latest_value)", y="latest_value"))
+    + geom_col(fill="#c0392b", width=0.65)
+    + geom_text(
+        aes(label="value_label"),
+        ha="left",
+        nudge_y=0.4,
+        size=9,
+        color="#333333"
+    )
+    + coord_flip()
+    + scale_y_continuous(limits=(0, 40))
+    + labs(
+        title="Bottom 10 Countries — Antenatal Care Coverage (Latest Available Year)",
+        subtitle="Percentage of women (aged 15–49) with 4+ antenatal visits",
+        x=None,
+        y="Coverage (%)"
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(size=12, face="bold"),
+        plot_subtitle=element_text(size=9.5, color="#555555"),
+        panel_grid_minor=element_blank(),
+        panel_grid_major_y=element_blank()
+    )
+)
+```
+
+The difference between the highest and the lowest is unimaginable - over 80 percent in most instances. The bottom of this chart is dominated by countries in the Sub-Saharan region of Africa and in some areas of South-Asia, which are typified by historic healthcare inequalities in infrastructure and access.
+
+---
+
+### 4. Starting coverage vs. improvement over time (scatterplot with regression)
+
+Is low starting point predictive of larger improvements? This scatterplot will compare the value of each countries first reported coverage value with the degree to which it has improved by the latest survey. A downward regression line would indicate that the countries which had a low beginning would be able to improve more, an upward line would indicate that the advantages would compound.
+
+```{python}
+(
+    ggplot(compare, aes(x="first_value", y="improvement"))
+    + geom_hline(yintercept=0, linetype="dashed", color="#aaaaaa", size=0.7)
+    + geom_point(alpha=0.55, color="#e67e22", size=2.5)
+    + geom_smooth(method="lm", se=True, color="#c0392b", fill="#f1948a", alpha=0.25)
+    + labs(
+        title="First Reported Coverage vs. Subsequent Improvement",
+        subtitle="Each point is one country. Improvement = latest value minus first value.",
+        x="First Reported Coverage (%)",
+        y="Change in Coverage (percentage points)"
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(size=12, face="bold"),
+        plot_subtitle=element_text(size=9.5, color="#555555"),
+        panel_grid_minor=element_blank()
+    )
+)
+```
+
+The regression line is slightly negative, indicating that those countries which initially had a lower coverage did tend to have a higher improvement on average. But there is no strong relationship - the distribution of results at any initial level is vast. There are countries that have begun low that have made significant progress; there are countries that have made little movement. Initial position is not a determinant of trajectory.
+
+---
+
+### 5. Antenatal care coverage vs. GDP per capita
+
+The metadata file has GDP per capita data, which can be easily joined to the indicator data on country name. This scatterplot examines the hypothesis that richer nations will have more antenatal coverage.
+
+```{python}
+# GDP labels for axis ticks
+def gdp_labels(x):
+    return [
+        f"${(10**v)/1000:.0f}k" if (10**v) >= 1000 else f"${10**v:.0f}"
+        for v in x
+    ]
+
+(
+    ggplot(scatter_df, aes(x="log_gdp", y="latest_value"))
+    + geom_point(alpha=0.5, color="#2ecc71", size=2.5)
+    + geom_smooth(method="lm", se=True, color="#27ae60", fill="#a9dfbf", alpha=0.3)
+    + scale_x_continuous(
+        breaks=[2, 2.5, 3, 3.5, 4, 4.5],
+        labels=gdp_labels
+    )
+    + scale_y_continuous(limits=(0, 105), breaks=range(0, 110, 20))
+    + labs(
+        title="Antenatal Care Coverage vs. GDP per Capita",
+        subtitle="Each point is one country. GDP shown on a log scale (constant 2015 US$).",
+        x="GDP per Capita (log scale)",
+        y="Latest Coverage (%)"
+    )
+    + theme_minimal()
+    + theme(
+        plot_title=element_text(size=12, face="bold"),
+        plot_subtitle=element_text(size=9.5, color="#555555"),
+        panel_grid_minor=element_blank()
+    )
+)
+```
+
+The relationship between the two is seen to be positive, namely, there is a positive relationship between richer countries and the level of antenatal coverage. The relationship is not ideal though. High coverage has been achieved by strong public health programmes in several low- and middle-income countries, but some of the more prosperous countries have not yet done so. Money is important, but not fate.
+
+---
+
+### 6. World map — latest antenatal care coverage by country
+
+Lastly, this map is used to visualise the geographic distribution of the coverage of antenatal care globally, based on the latest survey value available in each country.
+
+```{python}
+import geopandas as gpd
+
+# ── Load world boundary shapefile ──────────────────────────────────────────────
+try:
+    from geodatasets import get_path
+    world = gpd.read_file(get_path("naturalearth_lowres"))
+except Exception:
+    world = gpd.read_file(
+        "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/"
+        "master/geojson/ne_110m_admin_0_countries.geojson"
+    )
+
+world = world.to_crs("EPSG:4326")
+
+# ── Standardise the country name column ───────────────────────────────────────
+name_col = "name" if "name" in world.columns else "ADMIN"
+world = world.rename(columns={name_col: "country"})
+
+# ── Harmonise country names ───────────────────────────────────────────────────
+name_fixes = {
+    "United States of America": "United States",
+    "Russian Federation": "Russia",
+    "Viet Nam": "Vietnam",
+    "Iran (Islamic Republic of)": "Iran",
+    "Bolivia (Plurinational State of)": "Bolivia",
+    "United Republic of Tanzania": "Tanzania",
+    "Syrian Arab Republic": "Syria",
+    "Democratic Republic of the Congo": "Dem. Rep. Congo",
+    "Congo": "Rep. Congo",
+    "Côte d'Ivoire": "Cote d'Ivoire",
+    "Lao PDR": "Lao People's Democratic Republic",
+    "Republic of Moldova": "Moldova",
+    "eSwatini": "Eswatini",
+    "Cabo Verde": "Cape Verde"
+}
+world["country"] = world["country"].replace(name_fixes)
+
+# ── Merge coverage data ───────────────────────────────────────────────────────
+map_data = world.merge(
+    latest_per_country[["country", "latest_value"]],
+    on="country",
+    how="left"
+)
+
+# ── Convert geometry safely ───────────────────────────────────────────────────
+def geom_to_xy(gdf):
+    rows = []
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        if geom.geom_type == "Polygon":
+            polygons = [geom]
+        elif geom.geom_type == "MultiPolygon":
+            polygons = list(geom.geoms)
+        else:
+            continue
+
+        for idx, poly in enumerate(polygons):
+            x_coords, y_coords = poly.exterior.xy
+            tmp = pd.DataFrame({"x": x_coords, "y": y_coords})
+            for col in gdf.columns:
+                if col != "geometry":
+                    tmp[col] = row[col]
+            tmp["group_id"] = f"{row['country']}_{idx}"
+            rows.append(tmp)
+
+    # SAFETY FIX
+    if len(rows) == 0:
+        raise ValueError("No geometry data available for plotting map.")
+
+    return pd.concat(rows, ignore_index=True)
+
+map_xy = geom_to_xy(map_data)
+
+(
+    ggplot(map_xy)
+    + geom_polygon(
+        aes(x="x", y="y", group="group_id", fill="latest_value"),
+        color="white",
+        size=0.08
+    )
+    + coord_equal()
+    + scale_fill_gradient(
+        low="#deebf7",
+        high="#08306b",
+        na_value="#d0d0d0",
+        name="Coverage\n(%)"
+    )
+    + labs(
+        title="Latest Antenatal Care Coverage (4+ Visits) by Country",
+        subtitle="Grey = no data available. Colour intensity shows coverage level.",
+        x=None,
+        y=None
+    )
+    + theme_void()
+    + theme(
+        plot_title=element_text(size=12, face="bold"),
+        plot_subtitle=element_text(size=9.5, color="#555555"),
+        legend_position="right"
+    )
+)
+```
+
+The global divide is at a glance in the map. In Europe, Central Asia, and some of Latin America, the deep blue (high coverage) is visible, whereas much of Sub-Saharan Africa is left in pale blue or grey with a coverage much lower than the world average. The picture is mixed in South and Southeast Asia - in some countries, there are great gains; there are countries that are miles behind.
+
+---
+
+## Key Findings
+
+Drawing the analysis together, a few clear findings stand out:
+
+- **The progress is not only actual, but not evenly distributed.** The average coverage of the globe has increased significantly during the last 20 years, yet the spread between the countries is immense, as some countries are approaching universal coverage, whereas others are below 20 percent.
+
+- **The geographical rift is sharp.** Sub-Saharan Africa has always been at the lowest position of the coverage rankings. All the countries with the lowest coverage are virtually in this region, and it indicates the long-standing structural hindrances to healthcare access.
+
+- **Money is fine, but not all.** The GDP per capita scatterplot indicates that richer nations are more likely to have good coverage, but there are instances of middle-income nations with good performance due to targeted public investment in health, and some of the rich countries have failed to deliver.
+
+- **There is a weak relationship between lower starters and improvement, however.** The scatterplot of the initial coverage versus improvement shows that most of the low coverage countries have gained greatly, though some have had minimal improvement even though they all began at the same low level.
+
+- **It is possible to have near universal coverage.** The presence of several countries at or close to 100% demonstrates that the objective of universal antenatal care is not an idealistic one - it is already achieved in countries with effective health systems.
+
+---
+
+## Conclusion
+
+This report relied on UNICEF data to analyze the coverage of antenatal care in the world today, and the way it has evolved over the years. The most obvious message is that of simultaneous development and unending inequality. The overall coverage is trending in the right direction. But the averages conceal a world, in which even the likelihood of a pregnant woman obtaining good antenatal care still varies enormously by the fact of place of birth.
+
+The bottom of these charts does not put the countries there randomly. They are also confronted by real problems such as poor health facilities, geographical location and inadequate public facilities. The bridging process will take longer than time; it will entail a concerted investment and political will.
+
+The statistics, with all its lapses and irregularities in the timing of surveys, give a clear enough picture: the means and the experience to provide good antenatal care is available. It is difficult to reach everybody with them.
+
+---
